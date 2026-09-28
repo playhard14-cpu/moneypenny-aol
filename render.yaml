@@ -1,0 +1,22 @@
+services:
+  - type: cron
+    name: moneypenny-aol
+    runtime: docker
+    plan: starter
+    region: virginia
+    schedule: "30 10,11 * * 1-5"
+    envVars:
+      - key: AOL_EMAIL
+        sync: false
+      - key: AOL_APP_PASSWORD
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: RECAP_TO
+        sync: false
+      - key: LOOKBACK_DAYS
+        value: "30"
+      - key: MAX_MESSAGES_PER_FOLDER
+        value: "250"
+      - key: OPENAI_MODEL
+        value: gpt-5-mini

@@ -99,7 +99,22 @@ def summarize(items,notes,key,model):
     try:
         with urlopen(req,timeout=300) as response: data=json.load(response)
     except HTTPError as exc:
-        raise RuntimeError(f'OpenAI returned HTTP {exc.code}. Check API billing, model access and key. No recap sent.') from None
+        # Report structured metadata only: never log the request, email bodies,
+        # raw response, or free-form provider message (which may echo input).
+        details = []
+        try:
+            error = json.loads(exc.read(65536)).get('error', {})
+            if isinstance(error, dict):
+                for field in ('type', 'code', 'param'):
+                    value = error.get(field)
+                    if isinstance(value, str) and re.fullmatch(r'[A-Za-z0-9_.\[\]-]{1,120}', value):
+                        if not any(secret and secret in value for secret in
+                                   (key, os.environ.get('AOL_APP_PASSWORD', ''))):
+                            details.append(field + '=' + value)
+        except (ValueError, AttributeError, OSError):
+            pass
+        detail = '; '.join(details) or 'No safe structured error details returned'
+        raise RuntimeError(f'OpenAI returned HTTP {exc.code}: {detail}. No recap sent.') from None
     if data.get('status')!='completed': raise RuntimeError('AI response incomplete. No recap sent.')
     result='\n'.join(c.get('text','') for item in data.get('output',[]) if item.get('type')=='message'
                      for c in item.get('content',[]) if c.get('type')=='output_text').strip()
@@ -131,6 +146,7 @@ def main():
         raise RuntimeError('AOL_EMAIL and RECAP_TO must each be one email address.')
     days=int(os.environ.get('LOOKBACK_DAYS','30')); limit=int(os.environ.get('MAX_MESSAGES_PER_FOLDER','250'))
     if not 1<=days<=90 or not 1<=limit<=1000: raise RuntimeError('Use 1-90 days and 1-1000 messages per folder.')
+    print(f'Moneypenny diagnostics v2: lookback={days} days; per-folder limit={limit}; model='+os.environ.get('OPENAI_MODEL','gpt-5-mini'), flush=True)
     items,notes=collect(account,os.environ['AOL_APP_PASSWORD'],days,limit)
     if not items: raise RuntimeError('No emails found. No recap sent; check mailbox/folders.')
     print(f'Read {len(items)} messages. Sending their text to OpenAI for analysis.')

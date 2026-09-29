@@ -422,7 +422,62 @@ def icloud_check():
     if '{DAV:}all' in privileges or '{DAV:}write' in privileges or '{DAV:}bind' in privileges:
         print('Server advertises write/create privileges; writing has NOT been tested.',flush=True)
     else: print('Write permission not confirmed by server metadata; read test only.',flush=True)
-    print('CALENDAR CHECK PASSED. No appointments added, changed or deleted. Google conflict checks and automatic scheduling are not enabled.',flush=True)
+    print('ICLOUD CONNECTION CHECK PASSED. No appointments added, changed or deleted.',flush=True)
+
+
+def google_calendar_checks():
+    """Fetch private Google feeds read-only. Never print their URLs or events."""
+    from urllib.parse import urlsplit
+    from urllib.request import build_opener, HTTPRedirectHandler, HTTPSHandler
+
+    class NoRedirect(HTTPRedirectHandler):
+        def redirect_request(self,*args,**kwargs): return None
+    opener=build_opener(NoRedirect(),HTTPSHandler(context=ssl.create_default_context()))
+    configs=(('Google primary','GOOGLE_CALENDAR_ICAL_URL'),('Google Family','GOOGLE_FAMILY_ICAL_URL'))
+    for label,key in configs:
+        url=os.environ.get(key,'').strip()
+        if not url: raise RuntimeError(f'{label}: missing {key} in Render. Combined check incomplete.')
+        try:
+            parts=urlsplit(url)
+            valid=(parts.scheme=='https' and parts.hostname in ('calendar.google.com','www.google.com')
+                   and parts.port in (None,443) and not parts.username and not parts.password
+                   and parts.path.startswith('/calendar/ical/') and '/private-' in parts.path
+                   and parts.path.endswith('/basic.ics') and not parts.fragment and not parts.query)
+        except ValueError: valid=False
+        if not valid:
+            raise RuntimeError(f'{label}: use the complete Secret address in iCal format, not a public or browser link.')
+        req=Request(url,headers={'Accept':'text/calendar','Cache-Control':'no-cache'},method='GET')
+        try:
+            with opener.open(req,timeout=60) as response:
+                data=response.read(20_000_001)
+        except HTTPError as exc:
+            if exc.code in (301,302,303,307,308):
+                raise RuntimeError(f'{label}: feed redirected; recopy the current Secret address. No redirected link was followed.') from None
+            raise RuntimeError(f'{label}: HTTP {exc.code}. Check the private calendar link in Render.') from None
+        except (URLError,TimeoutError):
+            raise RuntimeError(f'{label}: connection failed or timed out. Retry the check.') from None
+        if len(data)>20_000_000: raise RuntimeError(f'{label}: feed exceeds test size limit; coverage not verified.')
+        try: text=data.decode('utf-8-sig')
+        except UnicodeError: raise RuntimeError(f'{label}: feed text could not be decoded.') from None
+        # Structural validation only; dates/recurrence must be handled by a full
+        # iCalendar engine before conflict detection or scheduling is enabled.
+        lines=re.sub(r'\r?\n[ \t]','',text).splitlines()
+        stack=[]; count=0
+        for line in lines:
+            if line.startswith('BEGIN:'):
+                component=line[6:].strip()
+                if not stack and component!='VCALENDAR':
+                    raise RuntimeError(f'{label}: invalid calendar feed structure.')
+                stack.append(component)
+                if component=='VEVENT': count+=1
+            elif line.startswith('END:'):
+                if not stack or stack.pop()!=line[4:].strip():
+                    raise RuntimeError(f'{label}: incomplete or invalid calendar feed.')
+        if stack or not lines or lines[0].strip()!='BEGIN:VCALENDAR' or lines[-1].strip()!='END:VCALENDAR':
+            raise RuntimeError(f'{label}: response was not a complete iCalendar feed.')
+        print(f'{label}: feed read successfully; {count} event components across the supplied feed (not a next-30-days count).',flush=True)
+    print('ALL CALENDAR CONNECTION CHECKS PASSED: iCloud target, Google primary, Google Family.',flush=True)
+    print('Read-only test complete. No emails sent or calendar changes made. Conflict detection, recurrence expansion and automatic appointment creation are NOT enabled.',flush=True)
 
 
 def main():
@@ -430,7 +485,10 @@ def main():
     parser.add_argument('--calendar-check',action='store_true')
     args=parser.parse_args()
     if args.calendar_check or os.environ.get('ICLOUD_CHECK_ONLY','').strip().lower()=='true':
-        icloud_check(); return
+        print('Moneypenny combined calendar connection test v2',flush=True)
+        icloud_check()
+        google_calendar_checks()
+        return
     if not args.force and not due(datetime.now().astimezone()):
         print('Outside weekday 6:30-6:59 a.m. Eastern window; skipped.'); return
     required=('AOL_EMAIL','AOL_APP_PASSWORD','OPENAI_API_KEY','RECAP_TO')

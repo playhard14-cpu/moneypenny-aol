@@ -309,7 +309,7 @@ def deliver(account,password,recipient,text,appendix):
         smtp.login(account,password); smtp.send_message(msg)
 
 # Read-only CalDAV discovery. No calendar-writing methods are implemented here.
-def icloud_check():
+def icloud_check(all_calendars=False):
     import base64
     import xml.etree.ElementTree as ET
     from urllib.parse import urljoin, urlsplit
@@ -407,22 +407,29 @@ def icloud_check():
          '<d:prop><d:getetag/><c:calendar-data/></d:prop><c:filter><c:comp-filter name="VCALENDAR">'
          '<c:comp-filter name="VEVENT"><c:time-range start="'+a+'" end="'+b+'"/>'
          '</c:comp-filter></c:comp-filter></c:filter></c:calendar-query>')
-    root,_=request(url,'REPORT',xml,'1')
-    for response in root.findall('d:response',ns):
-        direct=response.findtext('d:status','',ns).split()
-        if len(direct)>1 and direct[1]!='200': raise RuntimeError('An event could not be read. Calendar test incomplete.')
-        good=[p for _,p in props(ET.fromstring('<d:multistatus xmlns:d="DAV:">'+ET.tostring(response,encoding='unicode')+'</d:multistatus>'))]
-        if not any(p.find('c:calendar-data',ns) is not None for p in good):
-            raise RuntimeError('An event was returned without readable calendar data. Calendar test incomplete.')
-    data=[p.findtext('c:calendar-data','',ns) for _,p in props(root)]
-    if any('BEGIN:VCALENDAR' not in value or 'BEGIN:VEVENT' not in value for value in data):
-        raise RuntimeError('Calendar event data was invalid. Test incomplete.')
-    print('Target calendar found and read successfully.',flush=True)
-    print(f'Next 30 days: {len(data)} event resources returned (recurring series are not individual appointment counts).',flush=True)
-    if '{DAV:}all' in privileges or '{DAV:}write' in privileges or '{DAV:}bind' in privileges:
-        print('Server advertises write/create privileges; writing has NOT been tested.',flush=True)
-    else: print('Write permission not confirmed by server metadata; read test only.',flush=True)
-    print('ICLOUD CONNECTION CHECK PASSED. No appointments added, changed or deleted.',flush=True)
+    feeds=[]
+    selected=list(calendars) if all_calendars else [url]
+    for index,calendar_url in enumerate(selected,1):
+        label='iCloud J2 Properties' if calendar_url==url else f'iCloud calendar {index}'
+        root,_=request(calendar_url,'REPORT',xml,'1')
+        data=[]
+        for response in root.findall('d:response',ns):
+            direct=response.findtext('d:status','',ns).split()
+            if len(direct)>1 and direct[1]!='200':
+                raise RuntimeError(f'{label}: an event could not be read; coverage incomplete.')
+            readable=[]
+            for stat in response.findall('d:propstat',ns):
+                status=stat.findtext('d:status','',ns).split()
+                value=stat.findtext('d:prop/c:calendar-data',None,ns)
+                if len(status)>1 and status[1]=='200' and value is not None: readable.append(value)
+            if not readable: raise RuntimeError(f'{label}: event data missing; coverage incomplete.')
+            data.extend(readable)
+        if any('BEGIN:VCALENDAR' not in value or 'BEGIN:VEVENT' not in value for value in data):
+            raise RuntimeError(f'{label}: invalid event data; coverage incomplete.')
+        feeds.append((label,data))
+        print(f'{label}: read successfully; {len(data)} event resources in the next 30 days.',flush=True)
+    print('ICLOUD CONNECTION CHECK PASSED. No calendar changes made.',flush=True)
+    return feeds
 
 
 def google_calendar_checks():
@@ -434,6 +441,7 @@ def google_calendar_checks():
         def redirect_request(self,*args,**kwargs): return None
     opener=build_opener(NoRedirect(),HTTPSHandler(context=ssl.create_default_context()))
     configs=(('Google primary','GOOGLE_CALENDAR_ICAL_URL'),('Google Family','GOOGLE_FAMILY_ICAL_URL'))
+    feeds=[]
     for label,key in configs:
         url=os.environ.get(key,'').strip()
         if not url: raise RuntimeError(f'{label}: missing {key} in Render. Combined check incomplete.')
@@ -475,9 +483,97 @@ def google_calendar_checks():
                     raise RuntimeError(f'{label}: incomplete or invalid calendar feed.')
         if stack or not lines or lines[0].strip()!='BEGIN:VCALENDAR' or lines[-1].strip()!='END:VCALENDAR':
             raise RuntimeError(f'{label}: response was not a complete iCalendar feed.')
+        feeds.append((label,[text]))
         print(f'{label}: feed read successfully; {count} event components across the supplied feed (not a next-30-days count).',flush=True)
     print('ALL CALENDAR CONNECTION CHECKS PASSED: iCloud target, Google primary, Google Family.',flush=True)
-    print('Read-only test complete. No emails sent or calendar changes made. Conflict detection, recurrence expansion and automatic appointment creation are NOT enabled.',flush=True)
+    return feeds
+
+
+def calendar_occurrences(feeds,start,end):
+    from datetime import date, time, timezone
+    from zoneinfo import ZoneInfo
+    try:
+        from icalendar import Calendar
+        import recurring_ical_events
+    except ImportError:
+        raise RuntimeError('Calendar dependencies missing. Upload the updated Dockerfile and rebuild.') from None
+    zone=ZoneInfo('America/New_York')
+    result=[]
+    for label,resources in feeds:
+        count=0
+        for raw in resources:
+            try:
+                cal=Calendar.from_ical(raw)
+                if cal.name!='VCALENDAR': raise ValueError()
+                # Reject malformed dates/timezones instead of silently claiming availability.
+                for item in cal.walk('VEVENT'):
+                    if item.errors or 'UID' not in item or 'DTSTART' not in item: raise ValueError()
+                    for field in ('DTSTART','DTEND','RECURRENCE-ID'):
+                        value=item.get(field)
+                        if value is not None and value.params.get('TZID') and isinstance(value.dt,datetime) and value.dt.tzinfo is None:
+                            raise ValueError()
+                events=recurring_ical_events.of(cal).between(start-timedelta(days=1),end+timedelta(days=1))
+                for event in events:
+                    if str(event.get('STATUS','')).upper()=='CANCELLED': continue
+                    if str(event.get('TRANSP','')).upper()=='TRANSPARENT': continue
+                    begin=event.decoded('DTSTART')
+                    all_day=isinstance(begin,date) and not isinstance(begin,datetime)
+                    finish=event.decoded('DTEND',None)
+                    if finish is None:
+                        finish=begin+event.decoded('DURATION',timedelta(days=1) if all_day else timedelta())
+                    def aware(value):
+                        if not isinstance(value,datetime): value=datetime.combine(value,time.min)
+                        return (value.replace(tzinfo=zone) if value.tzinfo is None else value).astimezone(timezone.utc)
+                    begin,finish=aware(begin),aware(finish)
+                    if finish<begin: raise ValueError()
+                    if finish<=start or begin>=end or finish==begin: continue
+                    uid=str(event['UID'])
+                    result.append({'calendar':label,'uid':uid,'start':begin,'end':finish,'all_day':all_day})
+                    count+=1
+                    if len(result)>20000: raise ValueError()
+            except Exception:
+                raise RuntimeError(f'{label}: unable to fully expand calendar events; conflict check incomplete. No scheduling allowed.') from None
+        print(f'{label}: {count} busy occurrences in the review window.',flush=True)
+    # Merge identical UID/time copies; preserve their calendar labels. Different UIDs
+    # remain potential overlaps even when their titles might be similar.
+    unique={}
+    for event in result:
+        key=(event['uid'],event['start'],event['end'])
+        if key in unique:
+            unique[key]['calendar']+=' / '+event['calendar']
+        else: unique[key]=event.copy()
+    return sorted(unique.values(),key=lambda e:e['start'])
+
+
+def find_calendar_overlaps(events):
+    active=[]; overlaps=[]
+    for event in sorted(events,key=lambda e:e['start']):
+        active=[other for other in active if other['end']>event['start']]
+        for other in active:
+            overlaps.append((other,event))
+            if len(overlaps)>50000:
+                raise RuntimeError('Too many overlaps; conflict check incomplete. Narrow the calendar scope before scheduling.')
+        active.append(event)
+    return overlaps
+
+
+def calendar_conflict_check(feeds):
+    from datetime import timezone
+    from zoneinfo import ZoneInfo
+    start=datetime.now(timezone.utc); end=start+timedelta(days=30)
+    zone=ZoneInfo('America/New_York')
+    events=calendar_occurrences(feeds,start,end)
+    overlaps=find_calendar_overlaps(events)
+    print(f'Review window: {start.astimezone(zone):%Y-%m-%d %H:%M} through {end.astimezone(zone):%Y-%m-%d %H:%M} America/New_York.',flush=True)
+    print(f'Potential overlaps: {len(overlaps)}. All-day busy events count; back-to-back events do not.',flush=True)
+    for left,right in overlaps[:100]:
+        a=max(left['start'],right['start']).astimezone(zone)
+        b=min(left['end'],right['end']).astimezone(zone)
+        print(f'Overlap {a:%Y-%m-%d %H:%M %Z} to {b:%Y-%m-%d %H:%M %Z}: {left["calendar"]} + {right["calendar"]}',flush=True)
+    if len(overlaps)>100: print(f'{len(overlaps)-100} additional overlaps omitted from logs; no all-clear issued.',flush=True)
+    print('Coverage: all discovered iCloud calendars and the two supplied Google feeds. Floating times and all-day dates use America/New_York. Event titles stay out of logs.',flush=True)
+    print('Google feed freshness is not guaranteed; this is an advisory check, not approval to book. Travel buffers and attendee availability are not checked.',flush=True)
+    print('CALENDAR CONFLICT CHECK COMPLETE. No email analysis, sending, or calendar changes. Automatic scheduling remains OFF.',flush=True)
 
 
 def main():
@@ -485,9 +581,9 @@ def main():
     parser.add_argument('--calendar-check',action='store_true')
     args=parser.parse_args()
     if args.calendar_check or os.environ.get('ICLOUD_CHECK_ONLY','').strip().lower()=='true':
-        print('Moneypenny combined calendar connection test v2',flush=True)
-        icloud_check()
-        google_calendar_checks()
+        print('Moneypenny read-only calendar conflict check v3',flush=True)
+        feeds=icloud_check(all_calendars=True)+google_calendar_checks()
+        calendar_conflict_check(feeds)
         return
     if not args.force and not due(datetime.now().astimezone()):
         print('Outside weekday 6:30-6:59 a.m. Eastern window; skipped.'); return

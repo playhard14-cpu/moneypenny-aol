@@ -308,9 +308,129 @@ def deliver(account,password,recipient,text,appendix):
     with smtplib.SMTP_SSL('smtp.aol.com',465,context=ssl.create_default_context(),timeout=60) as smtp:
         smtp.login(account,password); smtp.send_message(msg)
 
+# Read-only CalDAV discovery. No calendar-writing methods are implemented here.
+def icloud_check():
+    import base64
+    import xml.etree.ElementTree as ET
+    from urllib.parse import urljoin, urlsplit
+    from urllib.request import build_opener, HTTPRedirectHandler, HTTPSHandler
+    from datetime import timezone
+
+    keys=('ICLOUD_USERNAME','ICLOUD_APP_PASSWORD','ICLOUD_CALENDAR_NAME')
+    if any(not os.environ.get(k,'').strip() for k in keys):
+        raise RuntimeError('Calendar check: set ICLOUD_USERNAME, ICLOUD_APP_PASSWORD and ICLOUD_CALENDAR_NAME in Render.')
+    username=os.environ[keys[0]].strip(); password=os.environ[keys[1]].strip()
+    target=os.environ[keys[2]].strip()
+    auth='Basic '+base64.b64encode((username+':'+password).encode()).decode()
+    ns={'d':'DAV:','c':'urn:ietf:params:xml:ns:caldav'}
+
+    def safe_url(base,href):
+        url=urljoin(base,href); parts=urlsplit(url)
+        host=(parts.hostname or '').lower()
+        if (parts.scheme!='https' or parts.username or parts.password or parts.port not in (None,443)
+            or not (host=='caldav.icloud.com' or re.fullmatch(r'p\d+-caldav\.icloud\.com',host))):
+            raise RuntimeError('Calendar check stopped: unexpected calendar server address. No credentials sent to it.')
+        return url
+
+    class NoRedirect(HTTPRedirectHandler):
+        def redirect_request(self,*args,**kwargs): return None
+    opener=build_opener(NoRedirect(),HTTPSHandler(context=ssl.create_default_context()))
+
+    def request(url,method,xml,depth='0'):
+        if method not in ('PROPFIND','REPORT'):
+            raise RuntimeError('Calendar test permits read-only requests only.')
+        url=safe_url('https://caldav.icloud.com/',url)
+        for redirect in range(6):
+            req=Request(url,data=xml.encode(),method=method,headers={
+                'Authorization':auth,'Content-Type':'application/xml; charset=utf-8','Depth':depth})
+            try:
+                with opener.open(req,timeout=60) as response:
+                    raw=response.read(12_000_001)
+                    if len(raw)>12_000_000: raise RuntimeError('Calendar response too large for connection test.')
+            except HTTPError as exc:
+                if exc.code in (301,302,307,308) and exc.headers.get('Location'):
+                    url=safe_url(url,exc.headers['Location']); continue
+                if exc.code==401:
+                    raise RuntimeError('iCloud sign-in rejected. Check ICLOUD_USERNAME and the Apple app-specific password.') from None
+                if exc.code==403:
+                    raise RuntimeError('iCloud denied calendar access. Check shared-calendar access for this Apple account.') from None
+                raise RuntimeError(f'iCloud calendar HTTP {exc.code}. No calendars changed.') from None
+            except (URLError,TimeoutError):
+                raise RuntimeError('iCloud connection timed out or failed. No calendars changed; retry the test.') from None
+            if b'<!DOCTYPE' in raw.upper() or b'<!ENTITY' in raw.upper():
+                raise RuntimeError('Unsupported calendar XML response.')
+            try: root=ET.fromstring(raw)
+            except ET.ParseError: raise RuntimeError('iCloud returned invalid calendar XML.') from None
+            if root.tag!='{DAV:}multistatus': raise RuntimeError('Unexpected calendar response format.')
+            return root,url
+        raise RuntimeError('Too many iCloud redirects. No calendars changed.')
+
+    def props(root):
+        found=[]
+        for response in root.findall('d:response',ns):
+            href=response.findtext('d:href','',ns)
+            for stat in response.findall('d:propstat',ns):
+                status=stat.findtext('d:status','',ns).split()
+                if len(status)>1 and status[1]=='200':
+                    prop=stat.find('d:prop',ns)
+                    if prop is not None: found.append((href,prop))
+        return found
+
+    def propfind(url,fields,depth='0'):
+        xml='<d:propfind xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav"><d:prop>'+fields+'</d:prop></d:propfind>'
+        return request(url,'PROPFIND',xml,depth)
+
+    print('iCloud check v1: connecting read-only; no email analysis or sending.',flush=True)
+    root,base=propfind('https://caldav.icloud.com/','<d:current-user-principal/>')
+    principal=next((p.findtext('d:current-user-principal/d:href',None,ns) for _,p in props(root)
+                    if p.find('d:current-user-principal/d:href',ns) is not None),None)
+    if not principal: raise RuntimeError('iCloud did not return an account principal; calendar discovery incomplete.')
+    root,base=propfind(safe_url(base,principal),'<c:calendar-home-set/>')
+    homes=[h.text for _,p in props(root) for h in p.findall('c:calendar-home-set/d:href',ns) if h.text]
+    if not homes: raise RuntimeError('iCloud did not expose calendar homes for this account.')
+    calendars={}
+    for home in homes:
+        root,home_url=propfind(safe_url(base,home),'<d:displayname/><d:resourcetype/><d:current-user-privilege-set/>','1')
+        for href,prop in props(root):
+            if prop.find('d:resourcetype/c:calendar',ns) is None: continue
+            name=prop.findtext('d:displayname','',ns)
+            privileges={child.tag for v in prop.findall('d:current-user-privilege-set/d:privilege',ns) for child in v}
+            calendars[safe_url(home_url,href)]=(name,privileges)
+    matches=[(url,p) for url,(name,p) in calendars.items() if name.strip().casefold()==target.casefold()]
+    print(f'iCloud discovery succeeded: {len(calendars)} calendars visible.',flush=True)
+    if not matches: raise RuntimeError('Target calendar not found. Check ICLOUD_CALENDAR_NAME and the shared invitation for this account.')
+    if len(matches)>1: raise RuntimeError('Multiple calendars match ICLOUD_CALENDAR_NAME. Target is ambiguous; no calendars changed.')
+    url,privileges=matches[0]
+    start=datetime.now(timezone.utc);end=start+timedelta(days=30)
+    a=start.strftime('%Y%m%dT%H%M%SZ');b=end.strftime('%Y%m%dT%H%M%SZ')
+    xml=('<c:calendar-query xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">'
+         '<d:prop><d:getetag/><c:calendar-data/></d:prop><c:filter><c:comp-filter name="VCALENDAR">'
+         '<c:comp-filter name="VEVENT"><c:time-range start="'+a+'" end="'+b+'"/>'
+         '</c:comp-filter></c:comp-filter></c:filter></c:calendar-query>')
+    root,_=request(url,'REPORT',xml,'1')
+    for response in root.findall('d:response',ns):
+        direct=response.findtext('d:status','',ns).split()
+        if len(direct)>1 and direct[1]!='200': raise RuntimeError('An event could not be read. Calendar test incomplete.')
+        good=[p for _,p in props(ET.fromstring('<d:multistatus xmlns:d="DAV:">'+ET.tostring(response,encoding='unicode')+'</d:multistatus>'))]
+        if not any(p.find('c:calendar-data',ns) is not None for p in good):
+            raise RuntimeError('An event was returned without readable calendar data. Calendar test incomplete.')
+    data=[p.findtext('c:calendar-data','',ns) for _,p in props(root)]
+    if any('BEGIN:VCALENDAR' not in value or 'BEGIN:VEVENT' not in value for value in data):
+        raise RuntimeError('Calendar event data was invalid. Test incomplete.')
+    print('Target calendar found and read successfully.',flush=True)
+    print(f'Next 30 days: {len(data)} event resources returned (recurring series are not individual appointment counts).',flush=True)
+    if '{DAV:}all' in privileges or '{DAV:}write' in privileges or '{DAV:}bind' in privileges:
+        print('Server advertises write/create privileges; writing has NOT been tested.',flush=True)
+    else: print('Write permission not confirmed by server metadata; read test only.',flush=True)
+    print('CALENDAR CHECK PASSED. No appointments added, changed or deleted. Google conflict checks and automatic scheduling are not enabled.',flush=True)
+
+
 def main():
     parser=argparse.ArgumentParser(); parser.add_argument('--force',action='store_true');parser.add_argument('--dry-run',action='store_true')
+    parser.add_argument('--calendar-check',action='store_true')
     args=parser.parse_args()
+    if args.calendar_check or os.environ.get('ICLOUD_CHECK_ONLY','').strip().lower()=='true':
+        icloud_check(); return
     if not args.force and not due(datetime.now().astimezone()):
         print('Outside weekday 6:30-6:59 a.m. Eastern window; skipped.'); return
     required=('AOL_EMAIL','AOL_APP_PASSWORD','OPENAI_API_KEY','RECAP_TO')
